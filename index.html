@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>待機ループ</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main class="app">
+  <section class="stage-wrap">
+    <canvas id="stage" width="1280" height="720" aria-label="待機モーション"></canvas>
+    <div id="notice" class="notice" hidden></div>
+    <div class="hint">Space: 再生/停止 ・ H: パネル表示切替</div>
+  </section>
+  <aside id="panel" class="panel">
+    <header class="panel-head">
+      <h1>待機ループ</h1>
+      <span id="loopinfo" class="loopinfo"></span>
+    </header>
+    <div id="panel-body"></div>
+  </aside>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
