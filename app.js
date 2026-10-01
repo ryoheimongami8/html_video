@@ -412,6 +412,17 @@ const FX = [
       ctx.drawImage(spr.aura, c.ox + 250 * c.sc - r, c.oy + 400 * c.sc - r * 1.15, r * 2, r * 2.3);
       ctx.restore();
     } },
+  { id: 'atkflash', label: '攻撃の閃光（攻撃時のみ）', layer: 'top', on: true, amt: 0.7,
+    init() {},
+    draw(ctx, c, p, a) {
+      const f = c.atkFrame;
+      if (f < 17 || f > 27) return;
+      const u = (f - 17) / 10, al = Math.sin(Math.PI * Math.min(1, u * 1.15));
+      ctx.save(); ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = a * 0.55 * al; ctx.drawImage(spr.glow, 0, 0, W, H);
+      ctx.globalAlpha = a * 0.35 * al; ctx.fillStyle = '#cfe9ff'; ctx.fillRect(0, 0, W, H);
+      ctx.restore();
+    } },
   { id: 'vignette', label: 'ビネット', layer: 'top', on: true, amt: 0.3,
     init() {},
     draw(ctx, c, p, a) {
@@ -472,6 +483,65 @@ function drawBgAnimated(ctx, p) {
   ctx.globalAlpha = 1;
 }
 
+// ---------- 攻撃（連番フレーム再生＋足位置補正） ----------
+// 元GIFは生成時に体全体がドリフトして足が滑るため、各フレームを「後ろ足を接地点へピン」するよう
+// オフセットで平行移動して描く。オフセット = 自動算出(meta.json) + 手動補正(adj)。
+const ATK = { meta: null, imgs: [], loaded: 0, adj: [], phase: 'idle', t: 0, ret: 0, idleWait: 0,
+  autoOn: false, autoSec: 4, edit: false, editFrame: 0, onion: true, hit: false };
+const ATK_RETURN = 0.4;                 // 攻撃後に待機へ戻すクロスフェード秒
+const ADJ_KEY = LS_KEY + '_atkadj';
+function atkLoadAdj() {
+  const n = ATK.meta.n; ATK.adj = Array.from({ length: n }, () => [0, 0]);
+  try { const j = JSON.parse(localStorage.getItem(ADJ_KEY) || 'null'); if (j && j.length === n) ATK.adj = j; } catch (e) { }
+}
+function atkSaveAdj() { try { localStorage.setItem(ADJ_KEY, JSON.stringify(ATK.adj)); } catch (e) { } }
+function atkOff(i) {
+  const o = ATK.meta.frames[i].off, a = ATK.adj[i];
+  return [o[0] + a[0], o[1] + a[1]];
+}
+function atkFrameAt(t) { return Math.min(ATK.meta.n - 1, Math.floor(t / (ATK.meta.frameMs / 1000))); }
+function atkStart() {
+  if (!ATK.meta || ATK.loaded < ATK.meta.n) return;
+  ATK.phase = 'attack'; ATK.t = 0; ATK.edit = false; syncAtkUI();
+}
+function drawAtkFrame(ctx, lay, i, k, alpha) {      // k: オフセット倍率（戻り時に0へ）
+  const m = ATK.meta, o = atkOff(i);
+  const x = lay.ox + (m.crop[0] - m.idleOrigin[0] + o[0] * k) * lay.sc;
+  const y = lay.oy + (m.crop[1] - m.idleOrigin[1] + o[1] * k) * lay.sc;
+  ctx.save(); ctx.globalAlpha = alpha; ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(ATK.imgs[i], x, y, m.crop[2] * lay.sc, m.crop[3] * lay.sc); ctx.restore();
+}
+function drawAtkGuides(ctx, lay) {
+  const m = ATK.meta, X = (x) => lay.ox + (x - m.idleOrigin[0]) * lay.sc, Y = (y) => lay.oy + (y - m.idleOrigin[1]) * lay.sc;
+  ctx.save(); ctx.lineWidth = 1.5; ctx.setLineDash([8, 5]);
+  ctx.strokeStyle = 'rgba(255,70,70,.95)';
+  ctx.beginPath(); ctx.moveTo(X(m.ref.rear[0]), Y(560)); ctx.lineTo(X(m.ref.rear[0]), Y(m.ref.rear[1] + 20));
+  ctx.moveTo(X(m.ref.rear[0]) - 70 * lay.sc, Y(m.ref.rear[1])); ctx.lineTo(X(m.ref.rear[0]) + 70 * lay.sc, Y(m.ref.rear[1])); ctx.stroke();
+  ctx.strokeStyle = 'rgba(80,200,255,.95)';
+  ctx.beginPath(); ctx.moveTo(X(m.ref.front[0]) - 70 * lay.sc, Y(m.ref.front[1])); ctx.lineTo(X(m.ref.front[0]) + 70 * lay.sc, Y(m.ref.front[1])); ctx.stroke();
+  // 現フレームの検出足位置（補正後）
+  const d = m.frames[ATK.editFrame].det, o = atkOff(ATK.editFrame);
+  ctx.setLineDash([]);
+  [['rear', '#ff4646'], ['front', '#50c8ff']].forEach(([k, col]) => {
+    if (!d[k]) return; ctx.strokeStyle = col; ctx.beginPath();
+    ctx.arc(X(d[k][0] + o[0]), Y(d[k][1] + o[1]), 7, 0, TAU); ctx.stroke();
+  });
+  ctx.restore();
+}
+function atkVerify() {
+  const m = ATK.meta, rows = []; let worstY = 0, worstX = 0, planted = 0;
+  m.frames.forEach((f, i) => {
+    const o = atkOff(i);
+    if (f.det.rear) {
+      const ex = f.det.rear[0] + o[0] - m.ref.rear[0], ey = f.det.rear[1] + o[1] - m.ref.rear[1];
+      worstX = Math.max(worstX, Math.abs(ex)); worstY = Math.max(worstY, Math.abs(ey)); planted++;
+      if (Math.abs(ex) > 4 || Math.abs(ey) > 4) rows.push(i + ':(' + ex.toFixed(1) + ',' + ey.toFixed(1) + ')');
+    }
+  });
+  return { rearDetectedFrames: planted, worstRearErrX: +worstX.toFixed(2), worstRearErrY: +worstY.toFixed(2), over4px: rows };
+}
+window.__atkVerify = atkVerify;
+
 // ---------- メイン描画 ----------
 const canvas = document.getElementById('stage');
 const ctx = canvas.getContext('2d');
@@ -502,16 +572,29 @@ function render() {
     ctx.save(); ctx.translate(cx, cy); ctx.scale(1, 0.09);
     ctx.globalAlpha = 0.5; ctx.drawImage(spr.shadow, -260 * lay.sc, -260 * lay.sc, 520 * lay.sc, 520 * lay.sc); ctx.restore();
   }
+  const atkOn = ATK.meta && (ATK.phase === 'attack' || ATK.edit);
+  const atkRet = ATK.meta && ATK.phase === 'return' && !ATK.edit;
   if (state.charVisible) {
-    if (glReady) {
-      buildPositions(clock, !state.lockOff);
-      drawCharGL();
-      ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
-      ctx.drawImage(glc, lay.ox, lay.oy, CH.w * lay.sc, CH.h * lay.sc);
-    } else if (charImg) {
-      ctx.drawImage(charImg, lay.ox, lay.oy, CH.w * lay.sc, CH.h * lay.sc);
+    if (!atkOn) {
+      if (glReady) {
+        buildPositions(clock, !state.lockOff);
+        drawCharGL();
+        ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(glc, lay.ox, lay.oy, CH.w * lay.sc, CH.h * lay.sc);
+      } else if (charImg) {
+        ctx.drawImage(charImg, lay.ox, lay.oy, CH.w * lay.sc, CH.h * lay.sc);
+      }
+    }
+    if (atkRet) {                                   // 最終フレームを待機へクロスフェード（後ろ足は両方とも基準点なのでオフセット維持）
+      const u = sstep(0, 1, ATK.ret / ATK_RETURN);
+      drawAtkFrame(ctx, lay, ATK.meta.n - 1, 1, 1 - u);
+    }
+    if (atkOn) {
+      if (ATK.edit && ATK.onion) { drawAtkFrame(ctx, lay, 0, 1, 0.3); }
+      drawAtkFrame(ctx, lay, ATK.edit ? ATK.editFrame : atkFrameAt(ATK.t), 1, 1);
     }
   }
+  c.atkFrame = ATK.meta && ATK.phase === 'attack' && !ATK.edit ? atkFrameAt(ATK.t) : -1;
   layerFx('front');
   // 演出グレーディング
   const drawGrade = (g, alpha) => {
@@ -523,7 +606,8 @@ function render() {
   if (gPrev) drawGrade(gPrev.grade, 1 - mixT);
   drawGrade(grade, mixT);
   layerFx('top');
-  if (state.debug) drawDebug(lay);
+  if (ATK.edit && ATK.meta) drawAtkGuides(ctx, lay);
+  if (state.debug && !atkOn) drawDebug(lay);
 }
 
 function drawDebug(lay) {
@@ -548,6 +632,18 @@ function drawDebug(lay) {
 function frame(ts) {
   const dt = Math.min(0.1, (ts - last) / 1000 || 0); last = ts;
   if (state.playing) clock += dt * state.speed;
+  if (ATK.meta && !ATK.edit) {
+    if (ATK.phase === 'attack' && state.playing) {
+      ATK.t += dt * state.speed;
+      if (ATK.t >= ATK.meta.n * ATK.meta.frameMs / 1000) { ATK.phase = 'return'; ATK.ret = 0; syncAtkUI(); }
+    } else if (ATK.phase === 'return' && state.playing) {
+      ATK.ret += dt * state.speed;
+      if (ATK.ret >= ATK_RETURN) { ATK.phase = 'idle'; ATK.idleWait = 0; syncAtkUI(); }
+    } else if (ATK.phase === 'idle' && ATK.autoOn && state.playing) {
+      ATK.idleWait += dt;
+      if (ATK.idleWait >= ATK.autoSec) atkStart();
+    }
+  }
   if (stageState.mix < 1) stageState.mix = Math.min(1, stageState.mix + dt / 0.6);
   render();
   const li = document.getElementById('loopinfo');
@@ -606,7 +702,7 @@ function verify() {
   return res;
 }
 window.__verify = verify;
-window.__app = { state, S, stageState, PRESETS, FX, buildPositions, pos, setClock(t) { clock = t; render(); } };
+window.__app = { ATK, state, S, stageState, PRESETS, FX, buildPositions, pos, setClock(t) { clock = t; render(); } };
 
 // ---------- UI ----------
 function save() { try { localStorage.setItem(LS_KEY, JSON.stringify({ state, fx: state.fx })); } catch (e) { } }
@@ -632,6 +728,24 @@ function buildUI() {
   d1.append(r1);
   d1.append(el('<div class="row"><span>速度</span><input type="range" id="rgSpeed" min="0.2" max="2" step="0.05"><span class="val" id="vSpeed"></span></div>'));
   body.append(d1);
+  // 攻撃
+  const dA = el('<details open><summary>攻撃</summary></details>');
+  dA.append(el('<div class="row"><button id="btnAtk">⚔ 攻撃（A）</button><span class="val" id="atkState" style="width:auto"></span></div>'));
+  dA.append(el('<div class="row"><label><input type="checkbox" id="chAuto"> 自動で繰り返す</label><input type="range" id="rgAuto" min="1" max="12" step="0.5"><span class="val" id="vAuto"></span></div>'));
+  dA.append(el('<div class="dbg" id="atkLoad">攻撃フレーム読込中…</div>'));
+  body.append(dA);
+  // 攻撃フレーム補正
+  const dE = el('<details><summary>攻撃フレーム補正（足位置）</summary></details>');
+  dE.append(el('<div class="row"><label><input type="checkbox" id="chEdit"> 補正モード（フレーム停止して編集）</label></div>'));
+  dE.append(el('<div class="row"><button id="eBack">◀</button><input type="range" id="eFrame" min="0" max="59" step="1"><button id="eFwd">▶</button></div>'));
+  dE.append(el('<div class="dbg" id="eNum"></div>'));
+  dE.append(el('<div class="row"><span style="width:20px">X</span><button data-d="x-5">-5</button><button data-d="x-1">-1</button><button data-d="x1">+1</button><button data-d="x5">+5</button></div>'));
+  dE.append(el('<div class="row"><span style="width:20px">Y</span><button data-d="y-5">-5</button><button data-d="y-1">-1</button><button data-d="y1">+1</button><button data-d="y5">+5</button></div>'));
+  dE.append(el('<div class="row"><label><input type="checkbox" id="chOnion"> 待機ポーズを重ねる</label></div>'));
+  dE.append(el('<div class="row"><button id="eCopy">前フレームの補正をコピー</button><button id="eReset">このフレームを戻す</button></div>'));
+  dE.append(el('<div class="row"><button id="eAll">全補正リセット</button><button id="eExport">JSON出力</button><button id="eVerify">検証</button></div>'));
+  dE.append(el('<div class="dbg" id="eOut">赤の縦線・横線=後ろ足の接地基準、青の横線=前足の接地基準。丸=現フレームの検出足位置(補正後)。基準に重なるよう X/Y を調整。</div>'));
+  body.append(dE);
   // 演出
   const d2 = el('<details open><summary>演出（動きの切替）</summary></details>');
   d2.append(el('<div class="row"><label><input type="checkbox" id="chStage"> 演出を使う</label></div>'));
@@ -700,7 +814,43 @@ function buildUI() {
   document.getElementById('chDbg').onchange = (e) => { state.debug = e.target.checked; save(); };
   document.getElementById('chLock').onchange = (e) => { state.lockOff = e.target.checked; save(); };
   document.getElementById('btnVerify').onclick = verify;
+  bindAtkUI();
   refreshUI();
+}
+function syncAtkUI() {
+  const e = document.getElementById('atkState'); if (!e) return;
+  e.textContent = ATK.edit ? '補正中' : ATK.phase === 'attack' ? '攻撃中' : ATK.phase === 'return' ? '待機へ戻る' : '待機';
+}
+function bindAtkUI() {
+  const $ = (id) => document.getElementById(id);
+  $('btnAtk').onclick = atkStart;
+  $('chAuto').onchange = (e) => { ATK.autoOn = e.target.checked; ATK.idleWait = 0; };
+  $('rgAuto').value = ATK.autoSec; $('vAuto').textContent = ATK.autoSec + 's';
+  $('rgAuto').oninput = (e) => { ATK.autoSec = +e.target.value; $('vAuto').textContent = ATK.autoSec + 's'; };
+  const upd = () => {
+    if (!ATK.meta) return;
+    const o = atkOff(ATK.editFrame), a = ATK.adj[ATK.editFrame];
+    $('eFrame').value = ATK.editFrame;
+    $('eNum').textContent = 'フレーム ' + ATK.editFrame + ' / 自動(' + ATK.meta.frames[ATK.editFrame].off.join(',') + ') 手動(' + a[0] + ',' + a[1] + ') 合計(' + o[0].toFixed(1) + ',' + o[1].toFixed(1) + ')';
+  };
+  $('chEdit').onchange = (e) => { ATK.edit = e.target.checked && !!ATK.meta; if (ATK.edit) ATK.phase = 'idle'; syncAtkUI(); upd(); };
+  $('chOnion').checked = ATK.onion; $('chOnion').onchange = (e) => { ATK.onion = e.target.checked; };
+  const go = (f) => { ATK.editFrame = clamp(f, 0, (ATK.meta ? ATK.meta.n : 60) - 1); upd(); };
+  $('eFrame').oninput = (e) => go(+e.target.value);
+  $('eBack').onclick = () => go(ATK.editFrame - 1);
+  $('eFwd').onclick = () => go(ATK.editFrame + 1);
+  document.querySelectorAll('[data-d]').forEach((b) => {
+    b.onclick = () => {
+      if (!ATK.meta) return; const m = /([xy])(-?\d+)/.exec(b.dataset.d), a = ATK.adj[ATK.editFrame];
+      a[m[1] === 'x' ? 0 : 1] += +m[2]; atkSaveAdj(); upd();
+    };
+  });
+  $('eReset').onclick = () => { if (!ATK.meta) return; ATK.adj[ATK.editFrame] = [0, 0]; atkSaveAdj(); upd(); };
+  $('eCopy').onclick = () => { if (!ATK.meta || ATK.editFrame < 1) return; ATK.adj[ATK.editFrame] = ATK.adj[ATK.editFrame - 1].slice(); atkSaveAdj(); upd(); };
+  $('eAll').onclick = () => { if (!ATK.meta) return; ATK.adj = ATK.adj.map(() => [0, 0]); atkSaveAdj(); upd(); };
+  $('eExport').onclick = () => { if (!ATK.meta) return; const t = JSON.stringify(ATK.meta.frames.map((f, i) => atkOff(i).map((v) => +v.toFixed(1)))); $('eOut').textContent = t; try { navigator.clipboard.writeText(t); } catch (e) { } };
+  $('eVerify').onclick = () => { if (!ATK.meta) return; $('eOut').textContent = JSON.stringify(atkVerify()); };
+  window.__atkUpd = upd; upd(); syncAtkUI();
 }
 function refreshUI() {
   const $ = (id) => document.getElementById(id);
@@ -721,6 +871,7 @@ window.addEventListener('keydown', (e) => {
   if (/INPUT|TEXTAREA|SELECT/.test((e.target.tagName || '')) && e.target.type !== 'checkbox' && e.target.type !== 'radio' && e.target.type !== 'range') return;
   if (e.code === 'Space') { e.preventDefault(); state.playing = !state.playing; refreshUI(); }
   else if (e.key === 'h' || e.key === 'H') setPanelHidden(!state.panelHidden);
+  else if (e.key === 'a' || e.key === 'A') atkStart();
 });
 
 // ---------- 起動 ----------
@@ -744,8 +895,28 @@ function start(img) {
   try { glReady = initGL(img); } catch (e) { console.error(e); glReady = false; }
   if (!glReady) { const n = document.getElementById('notice'); n.hidden = false; n.textContent = 'WebGL が使えないため静止画表示です。'; }
   renderBg(); buildUI(); applyStage(); stageState.prev = null; stageState.mix = 1;
+  loadAttack();
   requestAnimationFrame((t) => { last = t; frame(t); });
 }
+function loadAttack() {
+  const info = document.getElementById('atkLoad'), btn = document.getElementById('btnAtk');
+  if (btn) btn.disabled = true;
+  fetch('assets/attack/meta.json').then((r) => r.json()).then((m) => {
+    ATK.meta = m; atkLoadAdj();
+    document.getElementById('eFrame').max = m.n - 1;
+    let done = 0;
+    for (let i = 0; i < m.n; i++) {
+      const im = new Image();
+      im.onload = im.onerror = () => {
+        done++; ATK.loaded = done; if (info) info.textContent = '攻撃フレーム ' + done + '/' + m.n;
+        if (done === m.n) { if (btn) btn.disabled = false; if (info) info.textContent = '攻撃フレーム ' + m.n + '枚 準備完了（Aキー/ステージのクリックでも発動）'; if (window.__atkUpd) window.__atkUpd(); }
+      };
+      im.src = 'assets/attack/f' + String(i).padStart(2, '0') + '.webp';
+      ATK.imgs.push(im);
+    }
+  }).catch(() => { if (info) info.textContent = '攻撃フレームを読み込めません'; });
+}
+canvas.addEventListener('click', () => { if (!ATK.edit) atkStart(); });
 const img = new Image();
 img.onload = () => start(img);
 img.onerror = () => { const n = document.getElementById('notice'); n.hidden = false; n.textContent = 'assets/character.png を読み込めません'; };
