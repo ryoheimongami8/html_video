@@ -513,6 +513,7 @@ function drawAtkFrame(ctx, lay, i, k, alpha) {      // k: オフセット倍率�
   const m = ATK.meta, o = atkOff(i);
   const x = lay.ox + (m.crop[0] - m.idleOrigin[0] + o[0] * k) * lay.sc;
   const y = lay.oy + (m.crop[1] - m.idleOrigin[1] + o[1] * k) * lay.sc;
+  if (!ATK.imgs[i] || !ATK.imgs[i].naturalWidth) return;
   ctx.save(); ctx.globalAlpha = alpha; ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(ATK.imgs[i], x, y, m.crop[2] * lay.sc, m.crop[3] * lay.sc); ctx.restore();
 }
