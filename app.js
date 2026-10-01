@@ -19,6 +19,7 @@ const FOOT_RECTS = [                       // 足固定マスク [x0,y0,x1,y1]�
 const FOOT_ANCHORS = [[72, 722], [440, 728]];
 const SWORD = { a: [148, 258], b: [492, 520] };
 const LS_KEY = 'html_video_idle_v1';
+const GH_DEF = { on: true, mode: 'grad', c1: '#4de1ff', c2: '#a35cff', count: 7, step: 2, opacity: 0.6, glow: true };
 
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 const sstep = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
@@ -134,6 +135,7 @@ const PRESETS = [
 const BASE = Object.assign({}, PRESETS[0], { id: 'base', grade: null, vig: 0 });
 
 // ---------- 変位計算 ----------
+let idleBlend = 1;
 const bufA = { x: new Float32Array(NV), y: new Float32Array(NV) };
 const bufB = { x: new Float32Array(NV), y: new Float32Array(NV) };
 const pos = new Float32Array(NV * 2);
@@ -250,8 +252,8 @@ function finalize(ax, ay, lockOn) {
     const rx = R[n * 2], ry = R[n * 2 + 1];
     if (lockOn && S.hard[n]) { pos[n * 2] = rx; pos[n * 2 + 1] = ry; continue; }   // 元座標を代入
     const f = lockOn ? 1 - S.fl[n] : 1;
-    pos[n * 2] = rx + ax[n] * f;
-    pos[n * 2 + 1] = ry + ay[n] * f;
+    pos[n * 2] = rx + ax[n] * f * idleBlend;
+    pos[n * 2 + 1] = ry + ay[n] * f * idleBlend;
   }
 }
 
@@ -298,6 +300,7 @@ const state = {
   bg: 'sunset', bgColor: '#3b4a6b', shadow: true,
   scale: 0.9, offX: 0, offY: 0,
   debug: false, lockOff: false,
+  ghost: { on: true, mode: 'grad', c1: '#4de1ff', c2: '#a35cff', count: 7, step: 2, opacity: 0.6, glow: true },
   panelHidden: false,
 };
 
@@ -486,9 +489,10 @@ function drawBgAnimated(ctx, p) {
 // ---------- 攻撃（連番フレーム再生＋足位置補正） ----------
 // 元GIFは生成時に体全体がドリフトして足が滑るため、各フレームを「後ろ足を接地点へピン」するよう
 // オフセットで平行移動して描く。オフセット = 自動算出(meta.json) + 手動補正(adj)。
-const ATK = { meta: null, imgs: [], loaded: 0, adj: [], phase: 'idle', t: 0, ret: 0, idleWait: 0,
+const ATK = { meta: null, imgs: [], loaded: 0, adj: [], phase: 'idle', t: 0, settle: 0, settleFrom: 1, ramp: 1, idleWait: 0,
   autoOn: false, autoSec: 4, edit: false, editFrame: 0, onion: true, hit: false };
-const ATK_RETURN = 0.4;                 // 攻撃後に待機へ戻すクロスフェード秒
+const ATK_SETTLE = 0.18;                // 攻撃前: 待機の揺れを0へ収める秒
+const ATK_RAMP = 0.7;                   // 攻撃後: 待機の揺れを0から戻す秒
 const ADJ_KEY = LS_KEY + '_atkadj';
 function atkLoadAdj() {
   const n = ATK.meta.n; ATK.adj = Array.from({ length: n }, () => [0, 0]);
@@ -502,7 +506,8 @@ function atkOff(i) {
 function atkFrameAt(t) { return Math.min(ATK.meta.n - 1, Math.floor(t / (ATK.meta.frameMs / 1000))); }
 function atkStart() {
   if (!ATK.meta || ATK.loaded < ATK.meta.n) return;
-  ATK.phase = 'attack'; ATK.t = 0; ATK.edit = false; syncAtkUI();
+  if (ATK.phase === 'attack' || ATK.phase === 'settle') return;
+  ATK.edit = false; ATK.phase = 'settle'; ATK.settle = 0; ATK.settleFrom = idleBlend; syncAtkUI();
 }
 function drawAtkFrame(ctx, lay, i, k, alpha) {      // k: オフセット倍率（戻り時に0へ）
   const m = ATK.meta, o = atkOff(i);
@@ -510,6 +515,40 @@ function drawAtkFrame(ctx, lay, i, k, alpha) {      // k: オフセット倍率�
   const y = lay.oy + (m.crop[1] - m.idleOrigin[1] + o[1] * k) * lay.sc;
   ctx.save(); ctx.globalAlpha = alpha; ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(ATK.imgs[i], x, y, m.crop[2] * lay.sc, m.crop[3] * lay.sc); ctx.restore();
+}
+const ghostCv = document.createElement('canvas'); const ghostCtx = ghostCv.getContext('2d');
+const GH_SCALE = 0.6;
+function hexRgb(h) { const n = parseInt(h.slice(1), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; }
+function ghostColor(g, k, j) {          // k=1(新しい)..count(古い)
+  const t = g.count > 1 ? (k - 1) / (g.count - 1) : 0;
+  if (g.mode === 'orig') return null;
+  if (g.mode === 'solid') return g.c1;
+  if (g.mode === 'rainbow') return 'hsl(' + ((j * 9 + k * 38) % 360) + ',95%,62%)';
+  const a = hexRgb(g.c1), b = hexRgb(g.c2);
+  return 'rgb(' + a.map((v, i) => Math.round(lerp(v, b[i], t))).join(',') + ')';
+}
+function drawGhosts(ctx, lay, cur) {
+  const g = state.ghost, m = ATK.meta;
+  if (!g.on || cur <= 0) return;
+  const sw = Math.round(m.crop[2] * GH_SCALE), sh = Math.round(m.crop[3] * GH_SCALE);
+  if (ghostCv.width !== sw) { ghostCv.width = sw; ghostCv.height = sh; }
+  const fade = sstep(0, 1, (m.n - 1 - cur) / 8);                   // 攻撃の終わりで残像を消す
+  for (let k = g.count; k >= 1; k--) {
+    const j = cur - k * g.step;
+    if (j < 0 || !ATK.imgs[j]) continue;
+    const age = 1 - (k - 1) / (g.count + 0.5);
+    const al = g.opacity * age * age * fade;
+    if (al <= 0.01) continue;
+    const col = ghostColor(g, k, j);
+    ghostCtx.globalCompositeOperation = 'source-over'; ghostCtx.clearRect(0, 0, sw, sh);
+    ghostCtx.drawImage(ATK.imgs[j], 0, 0, sw, sh);
+    if (col) { ghostCtx.globalCompositeOperation = 'source-in'; ghostCtx.fillStyle = col; ghostCtx.fillRect(0, 0, sw, sh); }
+    const o = atkOff(j);
+    const x = lay.ox + (m.crop[0] - m.idleOrigin[0] + o[0]) * lay.sc, y = lay.oy + (m.crop[1] - m.idleOrigin[1] + o[1]) * lay.sc;
+    ctx.save(); ctx.globalAlpha = al; ctx.globalCompositeOperation = g.glow && col ? 'lighter' : 'source-over';
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(ghostCv, x, y, m.crop[2] * lay.sc, m.crop[3] * lay.sc); ctx.restore();
+  }
 }
 function drawAtkGuides(ctx, lay) {
   const m = ATK.meta, X = (x) => lay.ox + (x - m.idleOrigin[0]) * lay.sc, Y = (y) => lay.oy + (y - m.idleOrigin[1]) * lay.sc;
@@ -573,7 +612,6 @@ function render() {
     ctx.globalAlpha = 0.5; ctx.drawImage(spr.shadow, -260 * lay.sc, -260 * lay.sc, 520 * lay.sc, 520 * lay.sc); ctx.restore();
   }
   const atkOn = ATK.meta && (ATK.phase === 'attack' || ATK.edit);
-  const atkRet = ATK.meta && ATK.phase === 'return' && !ATK.edit;
   if (state.charVisible) {
     if (!atkOn) {
       if (glReady) {
@@ -585,13 +623,11 @@ function render() {
         ctx.drawImage(charImg, lay.ox, lay.oy, CH.w * lay.sc, CH.h * lay.sc);
       }
     }
-    if (atkRet) {                                   // 最終フレームを待機へクロスフェード（後ろ足は両方とも基準点なのでオフセット維持）
-      const u = sstep(0, 1, ATK.ret / ATK_RETURN);
-      drawAtkFrame(ctx, lay, ATK.meta.n - 1, 1, 1 - u);
-    }
     if (atkOn) {
+      const cf = ATK.edit ? ATK.editFrame : atkFrameAt(ATK.t);
       if (ATK.edit && ATK.onion) { drawAtkFrame(ctx, lay, 0, 1, 0.3); }
-      drawAtkFrame(ctx, lay, ATK.edit ? ATK.editFrame : atkFrameAt(ATK.t), 1, 1);
+      if (!ATK.edit) drawGhosts(ctx, lay, cf);
+      drawAtkFrame(ctx, lay, cf, 1, 1);
     }
   }
   c.atkFrame = ATK.meta && ATK.phase === 'attack' && !ATK.edit ? atkFrameAt(ATK.t) : -1;
@@ -629,22 +665,27 @@ function drawDebug(lay) {
   if (el && !el.dataset.hold) el.textContent = '足固定領域 最大変位(最終座標): ' + mx.toFixed(4) + ' px' + (state.lockOff ? '\n※固定OFF(比較表示)' : '');
 }
 
-function frame(ts) {
-  const dt = Math.min(0.1, (ts - last) / 1000 || 0); last = ts;
+function tick(dt) {
   if (state.playing) clock += dt * state.speed;
   if (ATK.meta && !ATK.edit) {
-    if (ATK.phase === 'attack' && state.playing) {
+    if (ATK.phase === 'settle' && state.playing) {
+      ATK.settle += dt * state.speed;
+      idleBlend = ATK.settleFrom * (1 - sstep(0, 1, ATK.settle / ATK_SETTLE));
+      if (ATK.settle >= ATK_SETTLE) { idleBlend = 0; ATK.phase = 'attack'; ATK.t = 0; syncAtkUI(); }
+    } else if (ATK.phase === 'attack' && state.playing) {
       ATK.t += dt * state.speed;
-      if (ATK.t >= ATK.meta.n * ATK.meta.frameMs / 1000) { ATK.phase = 'return'; ATK.ret = 0; syncAtkUI(); }
-    } else if (ATK.phase === 'return' && state.playing) {
-      ATK.ret += dt * state.speed;
-      if (ATK.ret >= ATK_RETURN) { ATK.phase = 'idle'; ATK.idleWait = 0; syncAtkUI(); }
-    } else if (ATK.phase === 'idle' && ATK.autoOn && state.playing) {
-      ATK.idleWait += dt;
-      if (ATK.idleWait >= ATK.autoSec) atkStart();
+      if (ATK.t >= ATK.meta.n * ATK.meta.frameMs / 1000) { ATK.phase = 'idle'; ATK.ramp = 0; ATK.idleWait = 0; idleBlend = 0; syncAtkUI(); }
+    } else if (ATK.phase === 'idle') {
+      if (ATK.ramp < 1 && state.playing) { ATK.ramp = Math.min(1, ATK.ramp + dt * state.speed / ATK_RAMP); idleBlend = sstep(0, 1, ATK.ramp); }
+      else if (ATK.ramp >= 1) idleBlend = 1;
+      if (ATK.autoOn && state.playing && ATK.ramp >= 1) { ATK.idleWait += dt; if (ATK.idleWait >= ATK.autoSec) atkStart(); }
     }
-  }
+  } else if (ATK.edit) idleBlend = 1;
   if (stageState.mix < 1) stageState.mix = Math.min(1, stageState.mix + dt / 0.6);
+}
+function frame(ts) {
+  const dt = Math.min(0.1, (ts - last) / 1000 || 0); last = ts;
+  tick(dt);
   render();
   const li = document.getElementById('loopinfo');
   if (li) li.textContent = frac(clock / LOOP_T).toFixed(2) + ' / ループ ' + LOOP_T + 's';
@@ -656,6 +697,7 @@ function verify() {
   const out = [];
   const savedStage = { cur: stageState.cur, prev: stageState.prev, mix: stageState.mix };
   stageState.prev = null; stageState.mix = 1;
+  const blendSaved = idleBlend; idleBlend = 1;
   let maxLock = 0, maxLoop = 0;
   const ax = new Float32Array(NV), ay = new Float32Array(NV), bx = new Float32Array(NV), by = new Float32Array(NV);
   for (const P of [...PRESETS, BASE]) {
@@ -691,7 +733,7 @@ function verify() {
       if (!(S.hard[a] && S.hard[a + 1] && S.hard[a + COLS + 1] && S.hard[a + COLS + 2])) uncovered++;
     }
   } catch (e) { uncovered = -1; }
-  stageState.cur = savedStage.cur; stageState.prev = savedStage.prev; stageState.mix = savedStage.mix;
+  stageState.cur = savedStage.cur; stageState.prev = savedStage.prev; stageState.mix = savedStage.mix; idleBlend = blendSaved;
   const res = { footMaxDisp: maxLock, loopClosureErr: maxLoop, uncoveredFootCells: uncovered };
   out.push('足固定 最大変位(全演出×1441サンプル+クロスフェード): ' + maxLock.toExponential(2) + ' px');
   out.push('ループ端 t=0 と t=T の頂点差 最大: ' + maxLoop.toExponential(2) + ' px');
@@ -702,7 +744,7 @@ function verify() {
   return res;
 }
 window.__verify = verify;
-window.__app = { ATK, state, S, stageState, PRESETS, FX, buildPositions, pos, setClock(t) { clock = t; render(); } };
+window.__app = { tick, render, ATK, ghostColor, drawGhosts, get idleBlend() { return idleBlend; }, state, S, stageState, PRESETS, FX, buildPositions, pos, setClock(t) { clock = t; render(); } };
 
 // ---------- UI ----------
 function save() { try { localStorage.setItem(LS_KEY, JSON.stringify({ state, fx: state.fx })); } catch (e) { } }
@@ -711,6 +753,7 @@ function load() {
     const j = JSON.parse(localStorage.getItem(LS_KEY) || 'null');
     if (j && j.state) { const { panelHidden, playing, ...rest } = j.state; Object.assign(state, rest); }
   } catch (e) { }
+  state.ghost = Object.assign({}, GH_DEF, state.ghost);
   for (const f of FX) if (!state.fx[f.id]) state.fx[f.id] = { on: f.on, amt: f.amt };
 }
 function el(html) { const t = document.createElement('template'); t.innerHTML = html.trim(); return t.content.firstChild; }
@@ -734,6 +777,22 @@ function buildUI() {
   dA.append(el('<div class="row"><label><input type="checkbox" id="chAuto"> 自動で繰り返す</label><input type="range" id="rgAuto" min="1" max="12" step="0.5"><span class="val" id="vAuto"></span></div>'));
   dA.append(el('<div class="dbg" id="atkLoad">攻撃フレーム読込中…</div>'));
   body.append(dA);
+  // 残像
+  const dG = el('<details open><summary>残像（攻撃時）</summary></details>');
+  dG.append(el('<div class="row"><label><input type="checkbox" id="chGh"> 残像を出す</label><label><input type="checkbox" id="chGlow"> 発光（加算）</label></div>'));
+  dG.append(el('<div class="row"><select id="selGh"><option value="grad">2色グラデ</option><option value="solid">単色</option><option value="rainbow">虹色</option><option value="orig">元の色</option></select><input type="color" id="colG1" title="新しい残像"><input type="color" id="colG2" title="古い残像"></div>'));
+  const pres = [['蒼雷', '#4de1ff', '#a35cff'], ['紅蓮', '#ff5a3c', '#ffd23c'], ['翠', '#5cffb0', '#2c7bff'], ['金', '#fff2a8', '#ff9a2c'], ['桜', '#ffc2e0', '#ff5fa0'], ['虚', '#ffffff', '#3a3a6a']];
+  const pr = el('<div class="swatches"></div>');
+  pres.forEach(([n, a, b]) => { const sb = el('<button class="sw"></button>'); sb.textContent = n; sb.style.background = 'linear-gradient(90deg,' + a + ',' + b + ')'; sb.onclick = () => { state.ghost.c1 = a; state.ghost.c2 = b; state.ghost.mode = 'grad'; refreshUI(); save(); }; pr.append(sb); });
+  dG.append(pr);
+  [['count', '本数', 1, 14, 1], ['step', '間隔(コマ)', 1, 5, 1], ['opacity', '濃さ', 0.1, 1, 0.05]].forEach(([k, l, mn, mx, st]) => {
+    const r = el('<div class="row"><span style="width:64px"></span><input type="range"><span class="val"></span></div>');
+    r.firstChild.textContent = l; const rg = r.querySelector('input'); rg.min = mn; rg.max = mx; rg.step = st; rg.value = state.ghost[k];
+    const v = r.querySelector('.val'); v.textContent = state.ghost[k];
+    rg.oninput = () => { state.ghost[k] = +rg.value; v.textContent = rg.value; save(); };
+    dG.append(r);
+  });
+  body.append(dG);
   // 攻撃フレーム補正
   const dE = el('<details><summary>攻撃フレーム補正（足位置）</summary></details>');
   dE.append(el('<div class="row"><label><input type="checkbox" id="chEdit"> 補正モード（フレーム停止して編集）</label></div>'));
@@ -815,11 +874,17 @@ function buildUI() {
   document.getElementById('chLock').onchange = (e) => { state.lockOff = e.target.checked; save(); };
   document.getElementById('btnVerify').onclick = verify;
   bindAtkUI();
+  const G = () => state.ghost, gi = (id) => document.getElementById(id);
+  gi('chGh').onchange = (e) => { G().on = e.target.checked; save(); };
+  gi('chGlow').onchange = (e) => { G().glow = e.target.checked; save(); };
+  gi('selGh').onchange = (e) => { G().mode = e.target.value; save(); };
+  gi('colG1').oninput = (e) => { G().c1 = e.target.value; save(); };
+  gi('colG2').oninput = (e) => { G().c2 = e.target.value; save(); };
   refreshUI();
 }
 function syncAtkUI() {
   const e = document.getElementById('atkState'); if (!e) return;
-  e.textContent = ATK.edit ? '補正中' : ATK.phase === 'attack' ? '攻撃中' : ATK.phase === 'return' ? '待機へ戻る' : '待機';
+  e.textContent = ATK.edit ? '補正中' : ATK.phase === 'attack' || ATK.phase === 'settle' ? '攻撃中' : ATK.ramp < 1 ? '待機へ戻る' : '待機';
 }
 function bindAtkUI() {
   const $ = (id) => document.getElementById(id);
@@ -861,6 +926,7 @@ function refreshUI() {
   document.querySelectorAll('input[name=preset]').forEach((r) => { r.checked = r.value === state.preset; r.closest('.opt').classList.toggle('on', r.checked && state.stageOn); });
   document.querySelectorAll('.sw').forEach((s) => s.classList.toggle('on', s.dataset.id === state.bg));
   $('colBg').value = state.bgColor; $('chShadow').checked = state.shadow;
+  $('chGh').checked = state.ghost.on; $('chGlow').checked = state.ghost.glow; $('selGh').value = state.ghost.mode; $('colG1').value = state.ghost.c1; $('colG2').value = state.ghost.c2;
   $('chDbg').checked = state.debug; $('chLock').checked = state.lockOff;
 }
 function setPanelHidden(h) {
@@ -907,11 +973,13 @@ function loadAttack() {
     let done = 0;
     for (let i = 0; i < m.n; i++) {
       const im = new Image();
-      im.onload = im.onerror = () => {
+      im.onerror = () => console.error('frame load failed', i);
+      im.onload = () => {
         done++; ATK.loaded = done; if (info) info.textContent = '攻撃フレーム ' + done + '/' + m.n;
         if (done === m.n) { if (btn) btn.disabled = false; if (info) info.textContent = '攻撃フレーム ' + m.n + '枚 準備完了（Aキー/ステージのクリックでも発動）'; if (window.__atkUpd) window.__atkUpd(); }
       };
-      im.src = 'assets/attack/f' + String(i).padStart(2, '0') + '.webp';
+      const an = m.attackN || m.n;
+      im.src = 'assets/attack/' + (i < an ? 'f' + String(i).padStart(2, '0') : 'r' + String(i - an).padStart(2, '0')) + '.webp';
       ATK.imgs.push(im);
     }
   }).catch(() => { if (info) info.textContent = '攻撃フレームを読み込めません'; });
